@@ -2,184 +2,192 @@
 //  mandel.c
 //  Based on example code found here:
 //  https://users.cs.fiu.edu/~cpoellab/teaching/cop4610_fall22/project3.html
-//
+//  
 //  Converted to use jpg instead of BMP and other minor changes
 //  
+// Modified by:
+// Justin Mahr
+// The program can generate multiple frames in parallel using child processes 
+// and optionally manages synchronization with semaphores for more efficient execution.
 ///
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <string.h>
 #include "jpegrw.h"
 
-// local routines
-static int iteration_to_color( int i, int max );
-static int iterations_at_point( double x, double y, int max );
-static void compute_image( imgRawImage *img, double xmin, double xmax,
-									double ymin, double ymax, int max );
+// Function prototypes
+static void generate_image(const char *outfile, double xcenter, double ycenter, 
+	double xscale, double yscale, int max, int imageWidth, int imageHeight);
 static void show_help();
 
+//  Run the multiprocessing and command line interface
+int main(int argc, char *argv[]) {
+    char c;
+    int numChildren = 1;
+    const char *outfilePrefix = "mandel";
+    double xcenter = 0;
+    double ycenter = 0; 
+    double xscale = 4;
+    double yscale = 0;
+    int imageWidth = 1000;
+    int imageHeight = 1000;
+    int max = 1000;
+    int numFrames = 50;
+    int useSemaphore = 0;
 
-int main( int argc, char *argv[] )
-{
-	char c;
 
-	// These are the default configuration values used
-	// if no command line arguments are given.
-	const char *outfile = "mandel.jpg";
-	double xcenter = 0;
-	double ycenter = 0;
-	double xscale = 4;
-	double yscale = 0; // calc later
-	int    image_width = 1000;
-	int    image_height = 1000;
-	int    max = 1000;
-
-	// For each command line argument given,
-	// override the appropriate configuration value.
-
-	while((c = getopt(argc,argv,"x:y:s:W:H:m:o:h"))!=-1) {
-		switch(c) 
-		{
-			case 'x':
-				xcenter = atof(optarg);
+    // Parse command-line arguments
+    while ((c = getopt(argc, argv, "n:x:y:s:W:H:m:f:p:Sh")) != -1) {
+        switch (c) {
+            case 'n': 
+				numChildren = atoi(optarg); 
 				break;
-			case 'y':
-				ycenter = atof(optarg);
+            case 'x': 
+				xcenter = atof(optarg); 
 				break;
-			case 's':
-				xscale = atof(optarg);
+            case 'y': 
+				ycenter = atof(optarg); 
 				break;
-			case 'W':
-				image_width = atoi(optarg);
+            case 's': 
+				xscale = atof(optarg); 
 				break;
-			case 'H':
-				image_height = atoi(optarg);
+            case 'W': 
+				imageWidth = atoi(optarg); 
 				break;
-			case 'm':
-				max = atoi(optarg);
+            case 'H': 
+				imageHeight = atoi(optarg); 
 				break;
-			case 'o':
-				outfile = optarg;
+            case 'm': 
+				max = atoi(optarg); 
 				break;
-			case 'h':
-				show_help();
+            case 'f': 
+				numFrames = atoi(optarg); 
+				break;
+            case 'p': 
+				outfilePrefix = optarg; 
+				break;
+            case 'S': 
+				useSemaphore = 1; 
+				break;
+            case 'h': 
+				show_help(); 
 				exit(1);
 				break;
-		}
-	}
+        }
+    }
 
-	// Calculate y scale based on x scale (settable) and image sizes in X and Y (settable)
-	yscale = xscale / image_width * image_height;
+    // Sets yscale incase command line input was entered
+    yscale = xscale / imageWidth * imageHeight;
+    // Initializes the semaphores
+    sem_t *sem = NULL;
 
-	// Display the configuration of the image.
-	printf("mandel: x=%lf y=%lf xscale=%lf yscale=%1f max=%d outfile=%s\n",xcenter,ycenter,xscale,yscale,max,outfile);
+    // Creates the semaphores if use is on
+    if (useSemaphore) {
+        sem = sem_open("/mandelSem", O_CREAT, 0644, numChildren);
+        if (sem == SEM_FAILED) {
+            perror("sem_open");
+            exit(EXIT_FAILURE);
+        }
+    }
 
-	// Create a raw image of the appropriate size.
-	imgRawImage* img = initRawImage(image_width,image_height);
+    // User interface and debug line
+    printf("Generating %d frames using %d child processes...\n", numFrames, numChildren);
 
-	// Fill it with a black
-	setImageCOLOR(img,0);
+    // This is the multiprossessing framework
+    // Forks until the number of images are created that was need
+    for (int i = 0; i < numFrames; i++) {
+        double scaleFactor = 1.0 - 0.02 * i; 
+        double currentXScale = xscale * scaleFactor;
+        double currentYScale = yscale * scaleFactor;
+        char outfile[256];
+        snprintf(outfile, sizeof(outfile), "%s_%03d.jpg", outfilePrefix, i);
 
-	// Compute the Mandelbrot image
-	compute_image(img,xcenter-xscale/2,xcenter+xscale/2,ycenter-yscale/2,ycenter+yscale/2,max);
+      	if (useSemaphore) sem_wait(sem);
 
-	// Save the image in the stated file.
-	storeJpegImageFile(img,outfile);
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process
+            generate_image(outfile, xcenter, ycenter, 
+			currentXScale, currentYScale, max, imageWidth, imageHeight);
+            if (useSemaphore) sem_post(sem);
+            exit(0);
+        } else if (pid < 0) {
+            perror("fork");
+            if (useSemaphore) sem_post(sem);
+        }
+    }
 
-	// free the mallocs
-	freeRawImage(img);
+    // Wait for all children to complete
+    while (wait(NULL) > 0);
 
-	return 0;
+    if (useSemaphore) {
+        sem_close(sem);
+        sem_unlink("/mandelSem");
+    }
+
+    printf("All frames generated successfully.\n");
+    return 0;
 }
+	
 
+// Function to generate a single Mandelbrot image
+static void generate_image(const char *outfile, double xcenter, double ycenter,
+double xscale, double yscale, int max, int imageWidth, int imageHeight) {
+    printf("Generating image: %s\n", outfile);
 
+    imgRawImage* img = initRawImage(imageWidth, imageHeight);
+    setImageCOLOR(img, 0);
 
+    double xmin = xcenter - xscale / 2;
+    double xmax = xcenter + xscale / 2;
+    double ymin = ycenter - yscale / 2;
+    double ymax = ycenter + yscale / 2;
 
-/*
-Return the number of iterations at point x, y
-in the Mandelbrot space, up to a maximum of max.
-*/
+    int width = img->width;
+    int height = img->height;
 
-int iterations_at_point( double x, double y, int max )
-{
-	double x0 = x;
-	double y0 = y;
+    for (int j = 0; j < height; j++) {
+        for (int i = 0; i < width; i++) {
+            double x = xmin + i * (xmax - xmin) / width;
+            double y = ymin + j * (ymax - ymin) / height;
+            int iter = 0;
+            double x0 = x, y0 = y;
 
-	int iter = 0;
+            while ((x * x + y * y <= 4) && iter < max) {
+                double xt = x * x - y * y + x0;
+                double yt = 2 * x * y + y0;
+                x = xt;
+                y = yt;
+                iter++;
+            }
 
-	while( (x*x + y*y <= 4) && iter < max ) {
+            int color = 0xFFFFFF * iter / (double)max;
+            setPixelCOLOR(img, i, j, color);
+        }
+    }
 
-		double xt = x*x - y*y + x0;
-		double yt = 2*x*y + y0;
-
-		x = xt;
-		y = yt;
-
-		iter++;
-	}
-
-	return iter;
+    storeJpegImageFile(img, outfile);
+    freeRawImage(img);
 }
-
-/*
-Compute an entire Mandelbrot image, writing each point to the given bitmap.
-Scale the image to the range (xmin-xmax,ymin-ymax), limiting iterations to "max"
-*/
-
-void compute_image(imgRawImage* img, double xmin, double xmax, double ymin, double ymax, int max )
-{
-	int i,j;
-
-	int width = img->width;
-	int height = img->height;
-
-	// For every pixel in the image...
-
-	for(j=0;j<height;j++) {
-
-		for(i=0;i<width;i++) {
-
-			// Determine the point in x,y space for that pixel.
-			double x = xmin + i*(xmax-xmin)/width;
-			double y = ymin + j*(ymax-ymin)/height;
-
-			// Compute the iterations at that point.
-			int iters = iterations_at_point(x,y,max);
-
-			// Set the pixel in the bitmap.
-			setPixelCOLOR(img,i,j,iteration_to_color(iters,max));
-		}
-	}
-}
-
-
-/*
-Convert a iteration number to a color.
-Here, we just scale to gray with a maximum of imax.
-Modify this function to make more interesting colors.
-*/
-int iteration_to_color( int iters, int max )
-{
-	int color = 0xFFFFFF*iters/(double)max;
-	return color;
-}
-
 
 // Show help message
-void show_help()
-{
-	printf("Use: mandel [options]\n");
-	printf("Where options are:\n");
-	printf("-m <max>    The maximum number of iterations per point. (default=1000)\n");
-	printf("-x <coord>  X coordinate of image center point. (default=0)\n");
-	printf("-y <coord>  Y coordinate of image center point. (default=0)\n");
-	printf("-s <scale>  Scale of the image in Mandlebrot coordinates (X-axis). (default=4)\n");
-	printf("-W <pixels> Width of the image in pixels. (default=1000)\n");
-	printf("-H <pixels> Height of the image in pixels. (default=1000)\n");
-	printf("-o <file>   Set output file. (default=mandel.bmp)\n");
-	printf("-h          Show this help text.\n");
-	printf("\nSome examples are:\n");
-	printf("mandel -x -0.5 -y -0.5 -s 0.2\n");
-	printf("mandel -x -.38 -y -.665 -s .05 -m 100\n");
-	printf("mandel -x 0.286932 -y 0.014287 -s .0005 -m 1000\n\n");
+static void show_help() {
+    printf("Usage: mandelmovie [options]\n");
+    printf("Options:\n");
+    printf("  -n <num>    Number of child processes to use (default=1)\n");
+    printf("  -x <coord>  X center coordinate of image (default=0)\n");
+    printf("  -y <coord>  Y center coordinate of image (default=0)\n");
+    printf("  -s <scale>  Scale of the image in Mandelbrot coordinates (X-axis). (default=4)\n");
+    printf("  -W <pixels> Image width in pixels (default=1000)\n");
+    printf("  -H <pixels> Image height in pixels (default=1000)\n");
+    printf("  -m <max>    Maximum iterations per point (default=1000)\n");
+    printf("  -f <frames> Number of frames to generate (default=50)\n");
+    printf("  -p <prefix> Output file prefix (default='mandel')\n");
+    printf("  -S          Use semaphore to manage child processes\n");
+    printf("  -h          Show this help message\n");
 }
