@@ -9,6 +9,7 @@
 // Justin Mahr
 // The program can generate multiple frames in parallel using child processes 
 // and optionally manages synchronization with semaphores for more efficient execution.
+// It now can use threading and processes at the same time
 ///
 
 #include <stdlib.h>
@@ -19,11 +20,29 @@
 #include <fcntl.h>
 #include <string.h>
 #include "jpegrw.h"
+#include <pthread.h>
+
 
 // Function prototypes
-static void generate_image(const char *outfile, double xcenter, double ycenter, 
-	double xscale, double yscale, int max, int imageWidth, int imageHeight);
+static void generateImage(const char *outfile, double xcenter, double ycenter,
+                          double width, double height, int xres, int yres, 
+                          int max_iter, int colorscheme);
+
 static void show_help();
+
+// ThreadArgs Structure
+typedef struct {
+    int startRow;
+    int endRow;
+    double xmin;
+    double xmax;
+    double ymax;
+    double ymin;
+    int imageWidth;
+    int imageHeight;
+    int max;
+    imgRawImage* img;
+} threading;
 
 //  Run the multiprocessing and command line interface
 int main(int argc, char *argv[]) {
@@ -39,11 +58,19 @@ int main(int argc, char *argv[]) {
     int max = 1000;
     int numFrames = 50;
     int useSemaphore = 0;
+    int numThreads = 1;
 
 
     // Parse command-line arguments
-    while ((c = getopt(argc, argv, "n:x:y:s:W:H:m:f:p:Sh")) != -1) {
+    while ((c = getopt(argc, argv, "t:n:x:y:s:W:H:m:f:p:Sh")) != -1) {
         switch (c) {
+            case 't':
+                numThreads = atoi(optarg);
+                if (numThreads < 1 || numThreads > 20) {
+                    fprintf(stderr, "Number of threads must be between 1 and 20.\n");
+                    exit(EXIT_FAILURE);
+                }
+                break;
             case 'n': 
 				numChildren = atoi(optarg); 
 				break;
@@ -83,6 +110,7 @@ int main(int argc, char *argv[]) {
 
     // Sets yscale incase command line input was entered
     yscale = xscale / imageWidth * imageHeight;
+
     // Initializes the semaphores
     sem_t *sem = NULL;
 
@@ -96,7 +124,7 @@ int main(int argc, char *argv[]) {
     }
 
     // User interface and debug line
-    printf("Generating %d frames using %d child processes...\n", numFrames, numChildren);
+    printf("Generating %d frames using %d child processes & %d threads\n", numFrames, numChildren, numThreads);
 
     // This is the multiprossessing framework
     // Forks until the number of images are created that was need
@@ -112,8 +140,8 @@ int main(int argc, char *argv[]) {
         pid_t pid = fork();
         if (pid == 0) {
             // Child process
-            generate_image(outfile, xcenter, ycenter, 
-			currentXScale, currentYScale, max, imageWidth, imageHeight);
+            generateImage(outfile, xcenter, ycenter, 
+			currentXScale, currentYScale, max, imageWidth, imageHeight, numThreads);
             if (useSemaphore) sem_post(sem);
             exit(0);
         } else if (pid < 0) {
@@ -133,11 +161,36 @@ int main(int argc, char *argv[]) {
     printf("All frames generated successfully.\n");
     return 0;
 }
-	
+
+// Splits up the Regions of the Mandel
+void* generateRegion(void* args) {
+    threading* threadArgs = (threading*)args;
+    for (int j = threadArgs->startRow; j < threadArgs->endRow; j++) {
+        for (int p = 0; p < threadArgs->imageWidth; p++) {
+            double x = threadArgs->xmin + p * (threadArgs->xmax - threadArgs->xmin) / threadArgs->imageWidth;
+            double y = threadArgs->ymin + j * (threadArgs->ymax - threadArgs->ymin) / threadArgs->imageHeight;
+            int iter = 0;
+            double x0 = x;
+            double y0 = y;
+
+            while ((x * x + y * y <= 4) && iter < threadArgs->max) {
+                double xt = x * x - y * y + x0;
+                double yt = 2 * x * y + y0;
+                x = xt;
+                y = yt;
+                iter++;
+            }
+            int color = 0xFFFFFF * iter / (double)threadArgs->max;
+            setPixelCOLOR(threadArgs->img, p, j, color);
+        }
+    }
+    return NULL;
+}
 
 // Function to generate a single Mandelbrot image
-static void generate_image(const char *outfile, double xcenter, double ycenter,
-double xscale, double yscale, int max, int imageWidth, int imageHeight) {
+static void generateImage(const char *outfile, double xcenter, double ycenter,
+                          double xscale, double yscale, int max,
+                          int imageWidth, int imageHeight, int numThreads) {
     printf("Generating image: %s\n", outfile);
 
     imgRawImage* img = initRawImage(imageWidth, imageHeight);
@@ -148,27 +201,31 @@ double xscale, double yscale, int max, int imageWidth, int imageHeight) {
     double ymin = ycenter - yscale / 2;
     double ymax = ycenter + yscale / 2;
 
-    int width = img->width;
-    int height = img->height;
+    pthread_t threads[numThreads];
+    threading threadArgs[numThreads];
 
-    for (int j = 0; j < height; j++) {
-        for (int i = 0; i < width; i++) {
-            double x = xmin + i * (xmax - xmin) / width;
-            double y = ymin + j * (ymax - ymin) / height;
-            int iter = 0;
-            double x0 = x, y0 = y;
+    int rowsPerThread = imageHeight / numThreads;
+    for (int i = 0; i < numThreads; i++) {
+        threadArgs[i].startRow = i * rowsPerThread;
+        threadArgs[i].endRow = (i == numThreads - 1) ? imageHeight : (i + 1) * rowsPerThread;
+        threadArgs[i].xmin = xmin;
+        threadArgs[i].xmax = xmax;
+        threadArgs[i].ymin = ymin;
+        threadArgs[i].ymax = ymax;
+        threadArgs[i].imageWidth = imageWidth;
+        threadArgs[i].imageHeight = imageHeight;
+        threadArgs[i].max = max;
+        threadArgs[i].img = img;
 
-            while ((x * x + y * y <= 4) && iter < max) {
-                double xt = x * x - y * y + x0;
-                double yt = 2 * x * y + y0;
-                x = xt;
-                y = yt;
-                iter++;
-            }
-
-            int color = 0xFFFFFF * iter / (double)max;
-            setPixelCOLOR(img, i, j, color);
+        if (pthread_create(&threads[i], NULL, generateRegion, &threadArgs[i]) != 0) {
+            perror("Error creating thread");
+            exit(EXIT_FAILURE);
         }
+    }
+
+    // Wait for all threads to complete
+    for (int i = 0; i < numThreads; i++) {
+        pthread_join(threads[i], NULL);
     }
 
     storeJpegImageFile(img, outfile);
@@ -190,4 +247,5 @@ static void show_help() {
     printf("  -p <prefix> Output file prefix (default='mandel')\n");
     printf("  -S          Use semaphore to manage child processes\n");
     printf("  -h          Show this help message\n");
+    printf("  -t <numThreads> Number of threads to use (default=1)\n");
 }
